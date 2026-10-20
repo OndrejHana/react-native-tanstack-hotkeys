@@ -1,0 +1,80 @@
+{
+  "name": "react-native-tanstack-hotkeys",
+  "version": "0.1.0",
+  "description": "TanStack Hotkeys for React Native: hardware keyboard shortcuts on iPadOS, Android, macOS, and Windows with the @tanstack/react-hotkeys API",
+  "license": "MIT",
+  "author": "OndrejHana",
+  "homepage": "https://github.com/OndrejHana/react-native-tanstack-hotkeys#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OndrejHana/react-native-tanstack-hotkeys.git"
+  },
+  "main": "lib/index.js",
+  "react-native": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./metro": "./metro.js",
+    "./core": "./lib/core/hotkeys.js",
+    "./core/adapter": "./lib/core/adapter.js",
+    "./package.json": "./package.json",
+    "./tsconfig.react-native.json": "./tsconfig.react-native.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "vendor",
+    "ios",
+    "android/build.gradle",
+    "android/src",
+    "metro.js",
+    "react-native-tanstack-hotkeys.podspec",
+    "patches",
+    "!**/__tests__",
+    "react-native.config.js",
+    "tsconfig.react-native.json"
+  ],
+  "keywords": [
+    "react-native",
+    "tanstack",
+    "hotkeys",
+    "keyboard",
+    "shortcuts",
+    "ipados",
+    "android",
+    "macos",
+    "windows"
+  ],
+  "tanstackHotkeys": {
+    "version": "0.17.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "vendor": "node scripts/vendor-core.mjs",
+    "verify:bundle": "node scripts/verify-bundle.mjs"
+  },
+  "dependencies": {
+    "@tanstack/store": "^0.11.2"
+  },
+  "peerDependencies": {
+    "@tanstack/react-hotkeys": "0.16.x",
+    "react": ">=18",
+    "react-native": ">=0.74"
+  },
+  "devDependencies": {
+    "@tanstack/react-hotkeys": "^0.16.0",
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-test-renderer": "^19.3.0",
+    "react": "^19.3.1",
+    "react-native": "^0.88.0",
+    "react-test-renderer": "^19.3.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

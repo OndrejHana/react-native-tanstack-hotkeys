@@ -1,0 +1,8 @@
+node_modules/
+android/build/
+android/.gradle/
+example/node_modules/
+example/build/
+*.tgz
+.DS_Store
+example/package-lock.json

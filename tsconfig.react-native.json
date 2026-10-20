@@ -1,0 +1,10 @@
+{
+  "//": "Types for TanStack Hotkeys patched for React Native. Extend it from your tsconfig.json; see the README.",
+  "compilerOptions": {
+    "paths": {
+      "@tanstack/hotkeys": ["./vendor/tanstack-hotkeys/dist/index.d.ts"],
+      "@tanstack/hotkeys/adapter": ["./vendor/tanstack-hotkeys/dist/adapter.d.ts"],
+      "@tanstack/react-hotkeys": ["./vendor/tanstack-react-hotkeys/dist/index.d.ts"]
+    }
+  }
+}

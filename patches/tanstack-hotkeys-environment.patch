@@ -1,0 +1,1061 @@
+From 63f1ee25b5a0327989b6bf692dd6935bb7c85552 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 20 Oct 2026 10:28:08 +0200
+Subject: [PATCH] feat(hotkeys): add HotkeysEnvironment for hosts without a DOM
+
+---
+ packages/hotkeys/src/_recording-guard.ts   |  32 ++-
+ packages/hotkeys/src/_target-listeners.ts  |  43 ++--
+ packages/hotkeys/src/adapter.ts            |   7 +-
+ packages/hotkeys/src/conflicts.ts          |  22 +-
+ packages/hotkeys/src/environment.ts        | 169 +++++++++++++++
+ packages/hotkeys/src/hotkey-manager.ts     |  45 ++--
+ packages/hotkeys/src/hotkey-recorder.ts    |  34 ++-
+ packages/hotkeys/src/index.ts              |   1 +
+ packages/hotkeys/src/key-state-tracker.ts  |  24 ++-
+ packages/hotkeys/src/platform.ts           |  23 +-
+ packages/hotkeys/tests/environment.test.ts | 234 +++++++++++++++++++++
+ packages/react-hotkeys/src/useHotkey.ts    |   6 +-
+ packages/react-hotkeys/src/utils.ts        |   2 +-
+ 13 files changed, 533 insertions(+), 109 deletions(-)
+ create mode 100644 packages/hotkeys/src/environment.ts
+ create mode 100644 packages/hotkeys/tests/environment.test.ts
+
+diff --git a/packages/hotkeys/src/_recording-guard.ts b/packages/hotkeys/src/_recording-guard.ts
+index 18cedb9..273008a 100644
+--- a/packages/hotkeys/src/_recording-guard.ts
++++ b/packages/hotkeys/src/_recording-guard.ts
+@@ -1,4 +1,5 @@
+ import { MODIFIER_KEYS, normalizeKeyName } from './constants'
++import { getHotkeysEnvironment } from './environment'
+ 
+ // Shared only by recorders and dispatchers. Does not own bindings or preferences.
+ // Multiple recorder instances may be active; dispatch resumes after the last one ends.
+@@ -7,7 +8,8 @@ const sessions = new Set<object>()
+ const captured = new WeakSet<KeyboardEvent>()
+ // Captured physical identities stay blocked through repeats and their eventual keyup.
+ const pending = new Map<string, string>()
+-let listening = false
++/** Removes the shared release and blur listeners while they are attached. */
++let stopListening: (() => void) | null = null
+ // Prefer the stable physical identity when modifier release changes event.key.
+ const identity = (event: KeyboardEvent) => event.code || `key:${event.key}`
+ 
+@@ -30,19 +32,31 @@ function blur(): void {
+ }
+ /** Detaches shared listeners once neither active sessions nor pending releases need them. */
+ function cleanup(): void {
+-  if (listening && sessions.size === 0 && pending.size === 0) {
+-    document.removeEventListener('keyup', release, true)
+-    window.removeEventListener('blur', blur)
+-    listening = false
++  if (stopListening && sessions.size === 0 && pending.size === 0) {
++    stopListening()
++    stopListening = null
+   }
+ }
+ /** Pauses application shortcut dispatch and starts tracking releases for this recorder. */
+ export function beginRecording(owner: object): void {
+   sessions.add(owner)
+-  if (!listening && typeof document !== 'undefined') {
+-    document.addEventListener('keyup', release, true)
+-    window.addEventListener('blur', blur)
+-    listening = true
++  const environment = getHotkeysEnvironment()
++  const target = environment.defaultTarget()
++  if (!stopListening && target !== undefined) {
++    const removeRelease = environment.listen(
++      target,
++      'keyup',
++      release as EventListener,
++      true,
++    )
++    const globalTarget = environment.globalTarget()
++    const removeBlur = globalTarget
++      ? environment.listen(globalTarget, 'blur', blur, false)
++      : () => {}
++    stopListening = () => {
++      removeRelease()
++      removeBlur()
++    }
+   }
+ }
+ /** Ends a session while retaining guards for keys still held after commit or cancellation. */
+diff --git a/packages/hotkeys/src/_target-listeners.ts b/packages/hotkeys/src/_target-listeners.ts
+index aa183e3..58faa35 100644
+--- a/packages/hotkeys/src/_target-listeners.ts
++++ b/packages/hotkeys/src/_target-listeners.ts
+@@ -1,9 +1,11 @@
+-type Target = HTMLElement | Document | Window
++import { getHotkeysEnvironment } from './environment'
++import type { Target } from './environment'
++
+ type EventType = 'keydown' | 'keyup'
+ type ListenerGroup = {
+   ids: Set<string>
+-  keydown: EventListener
+-  keyup: EventListener
++  /** Removes the group's keydown and keyup listeners. */
++  remove: () => void
+ }
+ 
+ /** Shares keyboard listeners within each target and capture phase. */
+@@ -29,7 +31,8 @@ export class TargetListeners {
+   ) {}
+ 
+   add(target: Target, capture: boolean, id: string): void {
+-    if (typeof document === 'undefined') return
++    const environment = getHotkeysEnvironment()
++    if (environment.defaultTarget() === undefined) return
+     let phases = this.#targets.get(target)
+     if (!phases) {
+       phases = new Map()
+@@ -62,10 +65,26 @@ export class TargetListeners {
+           }
+           this.dispatch(event, target, eventType, capture, pending, first)
+         }
+-      group = { ids, keydown: listener('keydown'), keyup: listener('keyup') }
++      const removeKeydown = environment.listen(
++        target,
++        'keydown',
++        listener('keydown'),
++        capture,
++      )
++      const removeKeyup = environment.listen(
++        target,
++        'keyup',
++        listener('keyup'),
++        capture,
++      )
++      group = {
++        ids,
++        remove: () => {
++          removeKeydown()
++          removeKeyup()
++        },
++      }
+       phases.set(capture, group)
+-      target.addEventListener('keydown', group.keydown, capture)
+-      target.addEventListener('keyup', group.keyup, capture)
+     }
+     group.ids.add(id)
+   }
+@@ -76,19 +95,15 @@ export class TargetListeners {
+     if (!group) return
+     group.ids.delete(id)
+     if (group.ids.size === 0) {
+-      target.removeEventListener('keydown', group.keydown, capture)
+-      target.removeEventListener('keyup', group.keyup, capture)
++      group.remove()
+       phases!.delete(capture)
+       if (phases!.size === 0) this.#targets.delete(target)
+     }
+   }
+ 
+   destroy(): void {
+-    for (const [target, phases] of this.#targets) {
+-      for (const [capture, group] of phases) {
+-        target.removeEventListener('keydown', group.keydown, capture)
+-        target.removeEventListener('keyup', group.keyup, capture)
+-      }
++    for (const phases of this.#targets.values()) {
++      for (const group of phases.values()) group.remove()
+     }
+     this.#targets.clear()
+     this.#processed = new WeakMap()
+diff --git a/packages/hotkeys/src/adapter.ts b/packages/hotkeys/src/adapter.ts
+index c8a60e1..4a6234a 100644
+--- a/packages/hotkeys/src/adapter.ts
++++ b/packages/hotkeys/src/adapter.ts
+@@ -7,6 +7,7 @@ import {
+ import { isHotkeySequence, normalizeHotkey } from './parse'
+ import { defaultHotkeyOptions } from './_registration'
+ import { detectPlatform } from './platform'
++import { getHotkeysEnvironment } from './environment'
+ import type { AppHotkey, AppHotkeysStore } from './app-hotkeys'
+ import type {
+   HotkeyCallback,
+@@ -22,8 +23,8 @@ import type {
+   HotkeyOptions,
+   HotkeyRegistrationHandle,
+   HotkeySequenceOptions,
+-  Target,
+ } from './hotkey-manager'
++import type { Target } from './environment'
+ 
+ /**
+  * A hotkey and its callback, with optional per-binding options. Chords accept
+@@ -86,9 +87,7 @@ export function createHotkeyBindings() {
+           target:
+             'target' in merged
+               ? (merged.target ?? null)
+-              : typeof document === 'undefined'
+-                ? null
+-                : document,
++              : (getHotkeysEnvironment().defaultTarget() ?? null),
+           platform: merged.platform ?? detectPlatform(),
+         }
+         if (
+diff --git a/packages/hotkeys/src/conflicts.ts b/packages/hotkeys/src/conflicts.ts
+index 7d75db7..1f8f6f3 100644
+--- a/packages/hotkeys/src/conflicts.ts
++++ b/packages/hotkeys/src/conflicts.ts
+@@ -1,11 +1,12 @@
+ import { detectPlatform } from './platform'
+ import { isHotkeySequence, parseHotkey } from './parse'
+-import { getTargetDocument } from './_event-target'
++import { getHotkeysEnvironment } from './environment'
+ import { parsedChordsEqual } from './_match'
+ import { matchesKeyboardEvent } from './match'
+ import { toHotkeyRegistrationView } from './hotkey-manager'
+ import { managerRef } from './_manager-ref'
+ import type { HotkeyRegistrationView } from './hotkey-manager'
++import type { Target } from './environment'
+ import type {
+   RegisterableHotkey,
+   RegisterableHotkeyChord,
+@@ -18,7 +19,7 @@ export interface HotkeyConflict {
+ 
+ export interface HotkeyConflictOptions {
+   /** Intended registration target. Defaults to document; disjoint targets are excluded. */
+-  target?: HTMLElement | Document | Window
++  target?: Target
+   /** Check all targets instead of overlapping targets. Default: overlapping. */
+   scope?: 'overlapping' | 'all'
+   /** Intended event type. Default: keydown. */
+@@ -35,17 +36,6 @@ export interface HotkeyConflictOptions {
+   events?: ReadonlyArray<KeyboardEvent>
+ }
+ 
+-/** Whether two targets share a document and one contains the other (or is its window). */
+-function targetsOverlap(
+-  a: HTMLElement | Document | Window,
+-  b: HTMLElement | Document | Window,
+-): boolean {
+-  if (a === b) return true
+-  if (getTargetDocument(a) !== getTargetDocument(b)) return false
+-  if (!('contains' in a) || !('contains' in b)) return true
+-  return a.contains(b) || b.contains(a)
+-}
+-
+ /**
+  * Find equivalent bindings and sequence-prefix conflicts in the live registry.
+  * With source events, also checks observed logical/physical overlap. Does not
+@@ -63,8 +53,8 @@ export function findHotkeyConflicts(
+   if (steps.length === 0) return []
+   const platform = options.platform ?? detectPlatform()
+   const parsed = steps.map((step) => parseHotkey(step, platform))
+-  const target =
+-    options.target ?? (typeof document === 'undefined' ? undefined : document)
++  const environment = getHotkeysEnvironment()
++  const target = options.target ?? environment.defaultTarget()
+   const conflicts: Array<HotkeyConflict> = []
+   // Apply scope policy before comparing equivalent bindings or observed event overlap.
+   const matches = (
+@@ -79,7 +69,7 @@ export function findHotkeyConflicts(
+       options.exclude?.(registration) ||
+       (options.scope !== 'all' &&
+         target &&
+-        !targetsOverlap(target, registration.target))
++        !environment.targetsOverlap(target, registration.target))
+     )
+       return false
+     // Compare only the common prefix: a shorter sequence can collide with a longer one.
+diff --git a/packages/hotkeys/src/environment.ts b/packages/hotkeys/src/environment.ts
+new file mode 100644
+index 0000000..acfc00f
+--- /dev/null
++++ b/packages/hotkeys/src/environment.ts
+@@ -0,0 +1,169 @@
++import {
++  getTargetDocument,
++  isEventForTarget,
++  isTypingEvent,
++  shouldIgnoreInputEvent,
++} from './_event-target'
++
++/**
++ * Objects hotkeys can listen on, by name. Hosts other than the browser add
++ * their target types through declaration merging:
++ *
++ * @example
++ * ```ts
++ * declare module '@tanstack/hotkeys' {
++ *   interface HotkeyTargets {
++ *     native: MyNativeTarget
++ *   }
++ * }
++ * ```
++ */
++export interface HotkeyTargets {
++  element: HTMLElement
++  document: Document
++  window: Window
++}
++
++/** An element, document, or window (or a host's own target) that hotkeys can listen on. */
++export type Target = HotkeyTargets[keyof HotkeyTargets]
++
++/** Event types hotkeys listen for. Hosts can ignore types they cannot deliver, such as mouse events. */
++export type HotkeysEventType =
++  'keydown' | 'keyup' | 'blur' | 'mousedown' | 'mousemove'
++
++/**
++ * Everything hotkeys need from the host that delivers keyboard events. The
++ * browser implementation is the default; hosts without a DOM, such as React
++ * Native, provide their own with `setHotkeysEnvironment` before registering
++ * hotkeys.
++ */
++export interface HotkeysEnvironment {
++  /**
++   * Target registrations and recorders use when none is given (the document
++   * in browsers). `undefined` when there is none, as during SSR: hotkeys
++   * without an explicit target are then inert.
++   */
++  defaultTarget: () => Target | undefined
++  /**
++   * Target for app-wide listeners (the window in browsers): held-key tracking
++   * and recording guards listen here for `keydown` and `keyup` during capture,
++   * and for `blur` when the app loses focus.
++   */
++  globalTarget: () => Target | undefined
++  /** Adds an event listener and returns a function that removes it. */
++  listen: (
++    target: Target,
++    type: HotkeysEventType,
++    listener: EventListener,
++    capture: boolean,
++  ) => () => void
++  /** The platform used to resolve `Mod` and format hotkeys. */
++  detectPlatform: () => 'mac' | 'windows' | 'linux'
++  /** Whether an event a listener on `target` received is for that target (originated from or bubbled to it). */
++  isEventForTarget: (event: KeyboardEvent, target: Target) => boolean
++  /** Whether an event's propagation path reaches `target`. */
++  eventReachesTarget: (event: KeyboardEvent, target: Target) => boolean
++  /**
++   * Whether a focused control inside `registrationTarget` handles the key
++   * itself, such as typing in a text field. See `HotkeyOptions.ignoreInputs`.
++   */
++  shouldIgnoreInputEvent: (
++    event: KeyboardEvent,
++    listenerTarget: Target,
++    registrationTarget: Target,
++  ) => boolean
++  /** Whether an event comes from a text field inside `target`. */
++  isTypingEvent: (event: KeyboardEvent, target: Target) => boolean
++  /** Whether hotkeys on one target can receive the same events as hotkeys on the other. */
++  targetsOverlap: (a: Target, b: Target) => boolean
++  /** Creates the synthetic event passed to callbacks triggered programmatically, such as from devtools. */
++  createKeyboardEvent: (
++    type: 'keydown' | 'keyup',
++    init: KeyboardEventInit,
++  ) => KeyboardEvent
++}
++
++type DomTarget = HTMLElement | Document | Window
++
++/** Detects the platform from browser navigator properties, defaulting to 'linux' without a navigator. */
++function detectBrowserPlatform(): 'mac' | 'windows' | 'linux' {
++  if (typeof navigator === 'undefined') {
++    return 'linux' // Default for SSR
++  }
++
++  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
++  const platform = navigator.platform?.toLowerCase() ?? ''
++  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
++  const userAgent = navigator.userAgent?.toLowerCase() ?? ''
++
++  if (platform.includes('mac') || userAgent.includes('mac')) {
++    return 'mac'
++  }
++  if (platform.includes('win') || userAgent.includes('win')) {
++    return 'windows'
++  }
++  return 'linux'
++}
++
++// Hosts can add their own types to HotkeyTargets, so DOM targets are narrowed
++// explicitly even though the assertions look unnecessary in a browser build.
++/* eslint-disable @typescript-eslint/no-unnecessary-type-assertion */
++/** The browser environment: DOM events on elements, the document, and the window. */
++export const domEnvironment: HotkeysEnvironment = {
++  defaultTarget: () => (typeof document === 'undefined' ? undefined : document),
++  globalTarget: () => (typeof window === 'undefined' ? undefined : window),
++  listen(target, type, listener, capture) {
++    const domTarget = target as DomTarget
++    domTarget.addEventListener(type, listener, capture)
++    return () => domTarget.removeEventListener(type, listener, capture)
++  },
++  detectPlatform: detectBrowserPlatform,
++  isEventForTarget: (event, target) =>
++    isEventForTarget(event, target as DomTarget),
++  eventReachesTarget(event, target) {
++    const domTarget = target as DomTarget
++    // A window or document target is reached through its document
++    return event
++      .composedPath()
++      .includes(
++        (domTarget as Node).nodeType === 1
++          ? domTarget
++          : getTargetDocument(domTarget),
++      )
++  },
++  shouldIgnoreInputEvent: (event, listenerTarget, registrationTarget) =>
++    shouldIgnoreInputEvent(
++      event,
++      listenerTarget as DomTarget,
++      registrationTarget as DomTarget,
++    ),
++  isTypingEvent: (event, target) => isTypingEvent(event, target as DomTarget),
++  targetsOverlap(a, b) {
++    if (a === b) return true
++    const domA = a as DomTarget
++    const domB = b as DomTarget
++    if (getTargetDocument(domA) !== getTargetDocument(domB)) return false
++    if (!('contains' in domA) || !('contains' in domB)) return true
++    return domA.contains(domB) || domB.contains(domA)
++  },
++  createKeyboardEvent: (type, init) => new KeyboardEvent(type, init),
++}
++/* eslint-enable @typescript-eslint/no-unnecessary-type-assertion */
++
++let current: HotkeysEnvironment = domEnvironment
++
++/** Returns the environment hotkeys use to listen for and interpret keyboard events. */
++export function getHotkeysEnvironment(): HotkeysEnvironment {
++  return current
++}
++
++/**
++ * Replaces the environment hotkeys use to listen for and interpret keyboard
++ * events, or restores the browser environment with `null`. Call it before
++ * registering hotkeys: existing listeners stay with the previous environment.
++ */
++export function setHotkeysEnvironment(
++  environment: HotkeysEnvironment | null,
++): void {
++  current = environment ?? domEnvironment
++}
+diff --git a/packages/hotkeys/src/hotkey-manager.ts b/packages/hotkeys/src/hotkey-manager.ts
+index 9173bdc..0ebbd03 100644
+--- a/packages/hotkeys/src/hotkey-manager.ts
++++ b/packages/hotkeys/src/hotkey-manager.ts
+@@ -21,11 +21,8 @@ import {
+   handleConflict,
+   optionsEqual,
+ } from './_registration'
+-import {
+-  getTargetDocument,
+-  isEventForTarget,
+-  shouldIgnoreInputEvent,
+-} from './_event-target'
++import { getHotkeysEnvironment } from './environment'
++import type { Target } from './environment'
+ import type { AppHotkeysStore } from './app-hotkeys'
+ import type { CanonicalModifier } from './key.types'
+ import type {
+@@ -45,9 +42,6 @@ import type {
+ 
+ export type { ConflictBehavior }
+ 
+-/** An element, document, or window that hotkeys can listen on. */
+-export type Target = HTMLElement | Document | Window
+-
+ /**
+  * Options shared by chords and sequences.
+  */
+@@ -695,8 +689,9 @@ export class HotkeyManager {
+       throw new Error('Sequence must contain at least one hotkey')
+     }
+ 
++    const defaultTarget = getHotkeysEnvironment().defaultTarget()
+     // In SSR environments, return a no-op handle since there's no DOM to attach listeners to
+-    if (typeof document === 'undefined' && !options.target) {
++    if (defaultTarget === undefined && !options.target) {
+       let currentCallback = callback
+       return {
+         id: generateId(),
+@@ -718,7 +713,7 @@ export class HotkeyManager {
+     const platform = options.platform ?? this.#platform
+     // Resolve target: default to document if not provided
+     // Note: SSR case without explicit target is handled above
+-    const target = options.target ?? document
++    const target = options.target ?? defaultTarget!
+ 
+     const sequence = isHotkeySequence(hotkey)
+     const resolvedOptions = {
+@@ -963,6 +958,7 @@ export class HotkeyManager {
+     }
+     if (isRecordingEvent(event) || this.#sequenceOwned.get(event)) return
+ 
++    const environment = getHotkeysEnvironment()
+     const matches = new Map<string, ReturnType<typeof matchKeyboardEvent>>()
+     let bestScore = 0
+ 
+@@ -971,9 +967,13 @@ export class HotkeyManager {
+       if (
+         !this.#isLive(registration) ||
+         registration.options.eventType !== eventType ||
+-        !isEventForTarget(event, target) ||
++        !environment.isEventForTarget(event, target) ||
+         (ignoresInputs(registration) &&
+-          shouldIgnoreInputEvent(event, target, registration.target))
++          environment.shouldIgnoreInputEvent(
++            event,
++            target,
++            registration.target,
++          ))
+       ) {
+         continue
+       }
+@@ -1066,7 +1066,7 @@ export class HotkeyManager {
+     ) {
+       return false
+     }
+-    const path = event.composedPath()
++    const environment = getHotkeysEnvironment()
+     const now = Date.now()
+     for (const registration of this.registrations.state.values()) {
+       if (
+@@ -1080,15 +1080,11 @@ export class HotkeyManager {
+         continue
+       }
+       const target = registration.target
+-      // A window or document target is reached through its document
+-      const reached = path.includes(
+-        (target as Node).nodeType === 1 ? target : getTargetDocument(target),
+-      )
+       if (
+-        reached &&
++        environment.eventReachesTarget(event, target) &&
+         !(
+           ignoresInputs(registration) &&
+-          shouldIgnoreInputEvent(event, target, target)
++          environment.shouldIgnoreInputEvent(event, target, target)
+         ) &&
+         matchKeyboardEvent(
+           event,
+@@ -1134,6 +1130,7 @@ export class HotkeyManager {
+       return
+     }
+ 
++    const environment = getHotkeysEnvironment()
+     const now = Date.now()
+     let changed = false
+     // Score eligible next steps (or restarts) before advancing any sequence.
+@@ -1142,10 +1139,14 @@ export class HotkeyManager {
+ 
+     for (const registration of registrations) {
+       if (
+-        !isEventForTarget(event, target) ||
++        !environment.isEventForTarget(event, target) ||
+         !this.#isLive(registration) ||
+         (ignoresInputs(registration) &&
+-          shouldIgnoreInputEvent(event, target, registration.target)) ||
++          environment.shouldIgnoreInputEvent(
++            event,
++            target,
++            registration.target,
++          )) ||
+         registration.options.eventType !== eventType
+       ) {
+         continue
+@@ -1350,7 +1351,7 @@ export class HotkeyManager {
+       registration.kind === 'chord'
+         ? registration.parsedChord
+         : registration.parsedSequence[registration.parsedSequence.length - 1]!
+-    const syntheticEvent = new KeyboardEvent(
++    const syntheticEvent = getHotkeysEnvironment().createKeyboardEvent(
+       registration.options.eventType ?? 'keydown',
+       {
+         ...(parsed.code !== undefined
+diff --git a/packages/hotkeys/src/hotkey-recorder.ts b/packages/hotkeys/src/hotkey-recorder.ts
+index 83678c1..b64e12b 100644
+--- a/packages/hotkeys/src/hotkey-recorder.ts
++++ b/packages/hotkeys/src/hotkey-recorder.ts
+@@ -10,7 +10,7 @@ import { normalizeKeyboardEvent } from './_keyboard-event'
+ import { isModifierKey, parseHotkey, simplifyHotkey } from './parse'
+ import { validateHotkey } from './validate'
+ import { detectPlatform } from './platform'
+-import { isTypingEvent } from './_event-target'
++import { getHotkeysEnvironment } from './environment'
+ import type { HotkeyConflict, HotkeyConflictOptions } from './conflicts'
+ import type {
+   Hotkey,
+@@ -189,12 +189,20 @@ const initialState: HotkeyRecorderState = {
+  * recorder.destroy()
+  * ```
+  */
++/** Whether an event comes from a text field in the default target. */
++function isTyping(event: KeyboardEvent): boolean {
++  const environment = getHotkeysEnvironment()
++  const target = environment.defaultTarget()
++  return target !== undefined && environment.isTypingEvent(event, target)
++}
++
+ export class HotkeyRecorder {
+   readonly store: Store<HotkeyRecorderState> = new Store<HotkeyRecorderState>(
+     initialState,
+   )
+ 
+   #keydownHandler: ((event: KeyboardEvent) => void) | null = null
++  #removeKeydownListener: (() => void) | null = null
+   #optionsSource: HotkeyRecorderOptions | (() => HotkeyRecorderOptions)
+   #optionOverrides: Partial<ResolvedRecorderOptions> = {}
+   #platform: 'mac' | 'windows' | 'linux'
+@@ -288,7 +296,7 @@ export class HotkeyRecorder {
+       if (
+         this.#options.ignoreInputs !== false &&
+         event.key !== 'Escape' &&
+-        isTypingEvent(event, document)
++        isTyping(event)
+       )
+         return
+ 
+@@ -451,7 +459,7 @@ export class HotkeyRecorder {
+     this.#clearIdleTimer()
+     // Remove listener FIRST to prevent any additional events
+     if (this.#keydownHandler) {
+-      this.#removeListener(this.#keydownHandler)
++      this.#removeListener()
+       this.#keydownHandler = null
+     }
+     this.store.setState(() => ({ ...initialState, recordedHotkey }))
+@@ -478,19 +486,23 @@ export class HotkeyRecorder {
+   }
+ 
+   #addListener(handler: (event: KeyboardEvent) => void): void {
+-    if (typeof document === 'undefined') {
++    const environment = getHotkeysEnvironment()
++    const target = environment.defaultTarget()
++    if (target === undefined) {
+       return // SSR safety
+     }
+ 
+-    document.addEventListener('keydown', handler, true)
++    this.#removeKeydownListener = environment.listen(
++      target,
++      'keydown',
++      handler as EventListener,
++      true,
++    )
+   }
+ 
+-  #removeListener(handler: (event: KeyboardEvent) => void): void {
+-    if (typeof document === 'undefined') {
+-      return
+-    }
+-
+-    document.removeEventListener('keydown', handler, true)
++  #removeListener(): void {
++    this.#removeKeydownListener?.()
++    this.#removeKeydownListener = null
+   }
+ 
+   /**
+diff --git a/packages/hotkeys/src/index.ts b/packages/hotkeys/src/index.ts
+index fda0287..f7c1a8c 100644
+--- a/packages/hotkeys/src/index.ts
++++ b/packages/hotkeys/src/index.ts
+@@ -1,6 +1,7 @@
+ export * from './constants'
+ export * from './display-labels'
+ export * from './platform'
++export * from './environment'
+ export * from './key.types'
+ export * from './hotkey.types'
+ export * from './format'
+diff --git a/packages/hotkeys/src/key-state-tracker.ts b/packages/hotkeys/src/key-state-tracker.ts
+index df89502..41edfab 100644
+--- a/packages/hotkeys/src/key-state-tracker.ts
++++ b/packages/hotkeys/src/key-state-tracker.ts
+@@ -1,5 +1,7 @@
+ import { Store } from '@tanstack/store'
+ import { MODIFIER_KEYS, normalizeKeyName } from './constants'
++import { getHotkeysEnvironment } from './environment'
++import type { HotkeysEventType } from './environment'
+ 
+ /**
+  * State interface for the KeyStateTracker.
+@@ -72,8 +74,8 @@ export class KeyStateTracker {
+   )
+ 
+   #heldEntries: Map<string, { key: string; code: string }> = new Map()
+-  /** Window listeners as `[type, listener, capture]`, removed together on destroy. */
+-  #listeners: Array<[string, EventListener, boolean]> = []
++  /** Removes the window listeners together on destroy. */
++  #removers: Array<() => void> = []
+ 
+   private constructor() {
+     this.#setupListeners()
+@@ -103,7 +105,9 @@ export class KeyStateTracker {
+    * Sets up the keyboard event listeners.
+    */
+   #setupListeners(): void {
+-    if (typeof document === 'undefined') {
++    const environment = getHotkeysEnvironment()
++    const target = environment.globalTarget()
++    if (environment.defaultTarget() === undefined || target === undefined) {
+       return // SSR safety
+     }
+ 
+@@ -162,16 +166,16 @@ export class KeyStateTracker {
+     // Window capture runs before every page listener, and stopPropagation
+     // doesn't stop other listeners on the same target, so no hotkey or
+     // widget can hide keys from the tracker.
+-    this.#listeners = [
++    const listeners: Array<[HotkeysEventType, EventListener, boolean]> = [
+       ['keydown', onKeydown as EventListener, true],
+       ['keyup', onKeyup as EventListener, true],
+       ['mousemove', onMouse as EventListener, true],
+       ['mousedown', onMouse as EventListener, true],
+       ['blur', onBlur, false],
+     ]
+-    for (const [type, listener, capture] of this.#listeners) {
+-      window.addEventListener(type, listener, capture)
+-    }
++    this.#removers = listeners.map(([type, listener, capture]) =>
++      environment.listen(target, type, listener, capture),
++    )
+   }
+ 
+   /**
+@@ -221,10 +225,8 @@ export class KeyStateTracker {
+    * Removes the keyboard event listeners.
+    */
+   #removeListeners(): void {
+-    for (const [type, listener, capture] of this.#listeners) {
+-      window.removeEventListener(type, listener, capture)
+-    }
+-    this.#listeners = []
++    for (const remove of this.#removers) remove()
++    this.#removers = []
+   }
+ 
+   /**
+diff --git a/packages/hotkeys/src/platform.ts b/packages/hotkeys/src/platform.ts
+index 63b9458..af368d5 100644
+--- a/packages/hotkeys/src/platform.ts
++++ b/packages/hotkeys/src/platform.ts
+@@ -1,13 +1,15 @@
++import { getHotkeysEnvironment } from './environment'
+ import type { CanonicalModifier } from './key.types'
+ 
+ /**
+- * Detects the current platform based on browser navigator properties.
++ * Detects the current platform. In browsers this reads navigator properties;
++ * other hosts report it through their `HotkeysEnvironment`.
+  *
+  * Used internally to resolve platform-adaptive modifiers like 'Mod' (Command on Mac,
+  * Control elsewhere) and for platform-specific hotkey formatting.
+  *
+  * @returns The detected platform: 'mac', 'windows', or 'linux'
+- * @remarks Defaults to 'linux' in SSR environments where navigator is undefined
++ * @remarks In browsers, defaults to 'linux' in SSR environments where navigator is undefined
+  *
+  * @example
+  * ```ts
+@@ -16,22 +18,7 @@ import type { CanonicalModifier } from './key.types'
+  * ```
+  */
+ export function detectPlatform(): 'mac' | 'windows' | 'linux' {
+-  if (typeof navigator === 'undefined') {
+-    return 'linux' // Default for SSR
+-  }
+-
+-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+-  const platform = navigator.platform?.toLowerCase() ?? ''
+-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+-  const userAgent = navigator.userAgent?.toLowerCase() ?? ''
+-
+-  if (platform.includes('mac') || userAgent.includes('mac')) {
+-    return 'mac'
+-  }
+-  if (platform.includes('win') || userAgent.includes('win')) {
+-    return 'windows'
+-  }
+-  return 'linux'
++  return getHotkeysEnvironment().detectPlatform()
+ }
+ 
+ /**
+diff --git a/packages/hotkeys/tests/environment.test.ts b/packages/hotkeys/tests/environment.test.ts
+new file mode 100644
+index 0000000..0202f18
+--- /dev/null
++++ b/packages/hotkeys/tests/environment.test.ts
+@@ -0,0 +1,234 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import {
++  HotkeyManager,
++  HotkeyRecorder,
++  KeyStateTracker,
++  detectPlatform,
++  domEnvironment,
++  findHotkeyConflicts,
++  getHotkeysEnvironment,
++  setHotkeysEnvironment,
++} from '../src'
++import type { HotkeysEnvironment, Target } from '../src'
++
++type Listener = { listener: EventListener; capture: boolean }
++
++/** A host without a DOM: one root that receives every key, and a text-field flag. */
++function createHost() {
++  const root = { name: 'root' } as unknown as Target
++  const listeners = new Map<string, Array<Listener>>()
++  let typing = false
++  let current: unknown = null
++
++  const event = (type: string, init: KeyboardEventInit) => {
++    let stopped = false
++    const keyEvent = {
++      type,
++      key: init.key ?? '',
++      code: init.code ?? '',
++      ctrlKey: !!init.ctrlKey,
++      shiftKey: !!init.shiftKey,
++      altKey: !!init.altKey,
++      metaKey: !!init.metaKey,
++      repeat: !!init.repeat,
++      location: 0,
++      isComposing: false,
++      isTrusted: true,
++      defaultPrevented: false,
++      get currentTarget() {
++        return current
++      },
++      getModifierState: () => false,
++      composedPath: () => [root],
++      preventDefault() {
++        keyEvent.defaultPrevented = true
++      },
++      stopPropagation() {
++        stopped = true
++      },
++      get stopped() {
++        return stopped
++      },
++    }
++    return keyEvent as unknown as KeyboardEvent & { stopped: boolean }
++  }
++
++  const environment: HotkeysEnvironment = {
++    defaultTarget: () => root,
++    globalTarget: () => root,
++    listen(target, type, listener, capture) {
++      expect(target).toBe(root)
++      const list = listeners.get(type) ?? []
++      const entry = { listener, capture }
++      list.push(entry)
++      listeners.set(type, list)
++      return () => list.splice(list.indexOf(entry), 1)
++    },
++    detectPlatform: () => 'mac',
++    isEventForTarget: (_event, target) => target === root,
++    eventReachesTarget: (_event, target) => target === root,
++    shouldIgnoreInputEvent: () => typing,
++    isTypingEvent: () => typing,
++    targetsOverlap: () => true,
++    createKeyboardEvent: (type, init) => event(type, init),
++  }
++
++  return {
++    root,
++    environment,
++    listenerCount: () =>
++      [...listeners.values()].reduce((sum, list) => sum + list.length, 0),
++    setTyping(value: boolean) {
++      typing = value
++    },
++    press(type: 'keydown' | 'keyup', init: KeyboardEventInit) {
++      const keyEvent = event(type, init)
++      const list = [...(listeners.get(type) ?? [])]
++      // Capture listeners first, then bubble, as on a single root
++      for (const capture of [true, false]) {
++        for (const entry of list.filter((l) => l.capture === capture)) {
++          current = root
++          entry.listener(keyEvent)
++          if (keyEvent.stopped) return keyEvent
++        }
++      }
++      current = null
++      return keyEvent
++    },
++    blur() {
++      for (const entry of listeners.get('blur') ?? []) {
++        entry.listener({ type: 'blur' } as Event)
++      }
++    },
++  }
++}
++
++describe('HotkeysEnvironment', () => {
++  afterEach(() => {
++    HotkeyManager.resetInstance()
++    KeyStateTracker.resetInstance()
++    setHotkeysEnvironment(null)
++  })
++
++  it('defaults to the DOM environment and restores it with null', () => {
++    expect(getHotkeysEnvironment()).toBe(domEnvironment)
++    const host = createHost()
++    setHotkeysEnvironment(host.environment)
++    expect(getHotkeysEnvironment()).toBe(host.environment)
++    setHotkeysEnvironment(null)
++    expect(getHotkeysEnvironment()).toBe(domEnvironment)
++  })
++
++  it('reads the platform from the environment', () => {
++    const host = createHost()
++    setHotkeysEnvironment(host.environment)
++    expect(detectPlatform()).toBe('mac')
++  })
++
++  it('registers on the default target and dispatches host events', () => {
++    const host = createHost()
++    setHotkeysEnvironment(host.environment)
++    const callback = vi.fn()
++    const handle = HotkeyManager.getInstance().register('Mod+S', callback)
++
++    expect(handle.isActive).toBe(true)
++    const event = host.press('keydown', {
++      key: 's',
++      code: 'KeyS',
++      metaKey: true,
++    })
++    expect(callback).toHaveBeenCalledTimes(1)
++    expect(event.defaultPrevented).toBe(true)
++
++    handle.unregister()
++    expect(host.listenerCount()).toBe(0)
++  })
++
++  it('asks the environment whether to ignore text input', () => {
++    const host = createHost()
++    setHotkeysEnvironment(host.environment)
++    const callback = vi.fn()
++    HotkeyManager.getInstance().register('K', callback)
++
++    host.setTyping(true)
++    host.press('keydown', { key: 'k', code: 'KeyK' })
++    expect(callback).not.toHaveBeenCalled()
++
++    host.setTyping(false)
++    host.press('keydown', { key: 'k', code: 'KeyK' })
++    expect(callback).toHaveBeenCalledTimes(1)
++  })
++
++  it('runs sequences through the environment', () => {
++    const host = createHost()
++    setHotkeysEnvironment(host.environment)
++    const callback = vi.fn()
++    HotkeyManager.getInstance().register(['G', 'G'], callback)
++
++    host.press('keydown', { key: 'g', code: 'KeyG' })
++    host.press('keyup', { key: 'g', code: 'KeyG' })
++    host.press('keydown', { key: 'g', code: 'KeyG' })
++    expect(callback).toHaveBeenCalledTimes(1)
++  })
++
++  it('tracks held keys on the global target and clears them on blur', () => {
++    const host = createHost()
++    setHotkeysEnvironment(host.environment)
++    const tracker = KeyStateTracker.getInstance()
++
++    host.press('keydown', { key: 'Shift', code: 'ShiftLeft', shiftKey: true })
++    expect(tracker.getHeldKeys()).toEqual(['Shift'])
++    host.blur()
++    expect(tracker.getHeldKeys()).toEqual([])
++  })
++
++  it('records through the environment and suppresses hotkeys meanwhile', () => {
++    const host = createHost()
++    setHotkeysEnvironment(host.environment)
++    const callback = vi.fn()
++    const onRecord = vi.fn()
++    HotkeyManager.getInstance().register('Mod+K', callback)
++    const recorder = new HotkeyRecorder({ onRecord })
++
++    recorder.start()
++    host.press('keydown', { key: 'k', code: 'KeyK', metaKey: true })
++    expect(onRecord).toHaveBeenCalledWith('Mod+[KeyK]')
++    expect(callback).not.toHaveBeenCalled()
++    recorder.destroy()
++  })
++
++  it('creates synthetic events with the environment', () => {
++    const host = createHost()
++    const createKeyboardEvent = vi.spyOn(
++      host.environment,
++      'createKeyboardEvent',
++    )
++    setHotkeysEnvironment(host.environment)
++    const callback = vi.fn()
++    const manager = HotkeyManager.getInstance()
++    const { id } = manager.register('Mod+S', callback)
++
++    expect(manager.triggerRegistration(id)).toBe(true)
++    expect(createKeyboardEvent).toHaveBeenCalledWith(
++      'keydown',
++      expect.objectContaining({ key: 'S', metaKey: true }),
++    )
++    expect(callback).toHaveBeenCalledTimes(1)
++  })
++
++  it('checks conflicts against the default target', () => {
++    const host = createHost()
++    setHotkeysEnvironment(host.environment)
++    HotkeyManager.getInstance().register('Mod+S', vi.fn())
++    expect(findHotkeyConflicts('Mod+S')).toHaveLength(1)
++  })
++
++  it('leaves hotkeys inert when the environment has no default target', () => {
++    setHotkeysEnvironment({
++      ...domEnvironment,
++      defaultTarget: () => undefined,
++    })
++    const handle = HotkeyManager.getInstance().register('Mod+S', vi.fn())
++    expect(handle.isActive).toBe(false)
++  })
++})
+diff --git a/packages/react-hotkeys/src/useHotkey.ts b/packages/react-hotkeys/src/useHotkey.ts
+index c81f0de..549ce62 100644
+--- a/packages/react-hotkeys/src/useHotkey.ts
++++ b/packages/react-hotkeys/src/useHotkey.ts
+@@ -4,6 +4,7 @@ import type {
+   HotkeyCallback,
+   HotkeyCallbackContextFor,
+   RegisterableHotkey,
++  Target,
+ } from '@tanstack/hotkeys'
+ import type {
+   AdapterAppHotkeyOptions,
+@@ -14,9 +15,8 @@ import type {
+   AdapterSequenceOptions,
+ } from '@tanstack/hotkeys/adapter'
+ 
+-/** A React ref, element, document, or window to listen on. */
+-export type UseHotkeyTarget =
+-  React.RefObject<HTMLElement | null> | HTMLElement | Document | Window | null
++/** A React ref, element, document, or window (or a host's own target) to listen on. */
++export type UseHotkeyTarget = React.RefObject<Target | null> | Target | null
+ 
+ /** Options shared by chords and sequences. */
+ export type UseHotkeyOptions = AdapterHotkeyOptions<UseHotkeyTarget>
+diff --git a/packages/react-hotkeys/src/utils.ts b/packages/react-hotkeys/src/utils.ts
+index e22dc53..d5044b5 100644
+--- a/packages/react-hotkeys/src/utils.ts
++++ b/packages/react-hotkeys/src/utils.ts
+@@ -5,7 +5,7 @@ import type { UseHotkeyTarget } from './useHotkey'
+ /**
+  * Type guard to check if a value is a React ref-like object.
+  */
+-function isRef(value: unknown): value is React.RefObject<HTMLElement | null> {
++function isRef(value: unknown): value is React.RefObject<Target | null> {
+   return value !== null && typeof value === 'object' && 'current' in value
+ }
+ 
+-- 
+2.43.0
+

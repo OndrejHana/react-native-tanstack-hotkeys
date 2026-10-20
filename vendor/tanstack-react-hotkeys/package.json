@@ -1,0 +1,9 @@
+{
+  "name": "@tanstack/react-hotkeys",
+  "version": "0.16.0",
+  "private": true,
+  "description": "Types of @tanstack/react-hotkeys with the HotkeysEnvironment patch, vendored by react-native-tanstack-hotkeys",
+  "license": "MIT",
+  "types": "./dist/index.d.ts",
+  "upstreamCommit": "2172bfc6a4a50b4adb6f86c3f79b6eb3ae7a28b3"
+}

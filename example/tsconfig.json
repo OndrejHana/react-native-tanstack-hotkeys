@@ -1,0 +1,10 @@
+{
+  "extends": [
+    "@react-native/typescript-config",
+    "react-native-tanstack-hotkeys/tsconfig.react-native.json"
+  ],
+  "compilerOptions": {
+    "types": []
+  },
+  "include": ["App.tsx"]
+}

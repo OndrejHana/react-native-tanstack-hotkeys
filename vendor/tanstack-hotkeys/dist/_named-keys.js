@@ -1,0 +1,65 @@
+//#region src/_named-keys.ts
+/** Names defined for both KeyboardEvent.key and KeyboardEvent.code, beyond the basic key groups. */
+const SHARED_NAMED_KEYS = [
+	"CapsLock",
+	"ContextMenu",
+	"Convert",
+	"KanaMode",
+	"NonConvert",
+	"Help",
+	"Insert",
+	"NumLock",
+	"Fn",
+	"FnLock",
+	"PrintScreen",
+	"ScrollLock",
+	"Pause",
+	"BrowserBack",
+	"BrowserFavorites",
+	"BrowserForward",
+	"BrowserHome",
+	"BrowserRefresh",
+	"BrowserSearch",
+	"BrowserStop",
+	"Eject",
+	"LaunchMail",
+	"MediaPlayPause",
+	"MediaStop",
+	"MediaTrackNext",
+	"MediaTrackPrevious",
+	"Power",
+	"AudioVolumeDown",
+	"AudioVolumeMute",
+	"AudioVolumeUp",
+	"WakeUp",
+	"Hyper",
+	"Super",
+	"Again",
+	"Copy",
+	"Cut",
+	"Find",
+	"Open",
+	"Paste",
+	"Props",
+	"Select",
+	"Undo",
+	"Hiragana",
+	"Katakana"
+];
+/** Logical counterparts whose physical positions use different names (for example Sleep and Lang1). */
+const LOGICAL_ONLY_NAMED_KEYS = [
+	"Clear",
+	"Cancel",
+	"Standby",
+	"LaunchApplication1",
+	"LaunchApplication2",
+	"LaunchMediaPlayer",
+	"HangulMode",
+	"HanjaMode",
+	"Zenkaku",
+	"Hankaku",
+	"ZenkakuHankaku"
+];
+
+//#endregion
+export { LOGICAL_ONLY_NAMED_KEYS, SHARED_NAMED_KEYS };
